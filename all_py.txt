@@ -1,0 +1,1916 @@
+
+
+# ===== FILE: cmd\api\main.go =====
+
+package main
+
+import (
+	"context"
+	"log"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"github.com/example/todo/internal/adapter/http"
+	"github.com/example/todo/internal/order"
+	"github.com/example/todo/internal/payment"
+	"github.com/example/todo/internal/user"
+	"github.com/labstack/echo/v4"
+)
+
+func main() {
+	orderRepo := order.NewRepo()
+	orderSvc := order.NewService(orderRepo)
+	orderHandler := order.NewHandler(orderSvc)
+
+	paymentRepo := payment.NewRepo()
+	paymentSvc := payment.NewService(paymentRepo)
+	paymentHandler := payment.NewHandler(paymentSvc)
+
+	userRepo := user.NewRepo()
+	userSvc := user.NewService(userRepo)
+	userHandler := user.NewHandler(userSvc)
+
+	server := http.NewServer()
+	server.RegisterRoutes(func(api *echo.Group) {
+		orderHandler.RegisterRoutes(api.Group("/orders"))
+		paymentHandler.RegisterRoutes(api.Group("/payments"))
+		userHandler.RegisterRoutes(api.Group("/users"))
+	})
+
+	port := getEnv("PORT", "8080")
+	addr := ":" + port
+
+	log.Printf("Server started on %s", addr)
+
+	go func() {
+		if err := server.Start(addr); err != nil {
+			log.Fatalf("server error: %v", err)
+		}
+	}()
+
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, os.Interrupt, syscall.SIGTERM)
+	<-quit
+
+	log.Println("Shutting down server...")
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := server.Shutdown(ctx); err != nil {
+		log.Fatalf("Server forced to shutdown: %v", err)
+	}
+	log.Println("Server exited")
+}
+
+func getEnv(key, defaultValue string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
+	}
+	return defaultValue
+}
+
+# ===== FILE: cmd\app\main.go =====
+
+package main
+
+import "github.com/Egor213/PVZ/internal/app"
+
+func main() {
+	app.Run()
+}
+
+
+# ===== FILE: internal\app\app.go =====
+
+package app
+
+func Run() {
+}
+
+
+# ===== FILE: internal\config\config.go =====
+
+package config
+
+import (
+	"os"
+	"time"
+
+	errutils "github.com/Egor213/PVZ/pkg/errors"
+
+	"github.com/ilyakaznacheev/cleanenv"
+	"github.com/joho/godotenv"
+	log "github.com/sirupsen/logrus"
+)
+
+type (
+	Config struct {
+		App  `yaml:"app"`
+		HTTP `yaml:"http"`
+		Log  `yaml:"log"`
+		PG   `yaml:"postgres"`
+		JWT  `yaml:"jwt"`
+	}
+
+	App struct {
+		Name    string `yaml:"name" env-required:"true"`
+		Version string `yaml:"version" env-required:"true"`
+	}
+
+	HTTP struct {
+		Address string `env-required:"true" env:"SERVER_ADDRESS"`
+	}
+
+	Log struct {
+		Level string `yaml:"level" env:"LOG_LEVEL" env-default:"info"`
+	}
+
+	PG struct {
+		URL         string `env-required:"true" env:"POSTGRES_CONN"`
+		MaxPoolSize int    `env-required:"true" env:"MAX_POOL_SIZE" yaml:"max_pool_size"`
+	}
+
+	JWT struct {
+		SignKey  string        `env-required:"true" env:"JWT_SIGN_KEY"`
+		TokenTTL time.Duration `yaml:"token_ttl" env:"TOKEN_TTL" env-required:"true"`
+	}
+)
+
+func New() (*Config, error) {
+	cfg := &Config{}
+
+	if err := godotenv.Load("infra/.env"); err != nil {
+		log.WithError(err).Info(".env file not found, using system environment")
+	}
+
+	pathToConfig, ok := os.LookupEnv("APP_CONFIG_PATH")
+	if !ok || pathToConfig == "" {
+		log.WithField("env_var", "APP_CONFIG_PATH").
+			Info("Config path is not set, using default")
+		pathToConfig = "config/config.yaml"
+	}
+
+	if err := cleanenv.ReadConfig(pathToConfig, cfg); err != nil {
+		return nil, errutils.WrapPathErr(err)
+	}
+
+	if err := cleanenv.UpdateEnv(cfg); err != nil {
+		return nil, errutils.WrapPathErr(err)
+	}
+
+	return cfg, nil
+}
+
+
+# ===== FILE: internal\domain\todo.go =====
+
+package domain
+
+import (
+	"errors"
+	"time"
+)
+
+var (
+	ErrEmptyTitle    = errors.New("title cannot be empty")
+	ErrTitleTooLong  = errors.New("title exceeds maximum length")
+	ErrNotFound      = errors.New("todo not found")
+	ErrInvalidStatus = errors.New("invalid status")
+)
+
+const (
+	MaxTitleLength = 200
+)
+
+type Status string
+
+const (
+	StatusPending   Status = "pending"
+	StatusInProgress Status = "in_progress"
+	StatusDone      Status = "done"
+)
+
+func (s Status) Valid() bool {
+	switch s {
+	case StatusPending, StatusInProgress, StatusDone:
+		return true
+	default:
+		return false
+	}
+}
+
+type Todo struct {
+	ID          string
+	Title       string
+	Description string
+	Status      Status
+	CreatedAt   time.Time
+	UpdatedAt   time.Time
+}
+
+func NewTodo(title, description string) (*Todo, error) {
+	if title == "" {
+		return nil, ErrEmptyTitle
+	}
+	if len(title) > MaxTitleLength {
+		return nil, ErrTitleTooLong
+	}
+	now := time.Now()
+	return &Todo{
+		ID:          "",
+		Title:       title,
+		Description: description,
+		Status:      StatusPending,
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}, nil
+}
+
+func (t *Todo) UpdateTitle(title string) error {
+	if title == "" {
+		return ErrEmptyTitle
+	}
+	if len(title) > MaxTitleLength {
+		return ErrTitleTooLong
+	}
+	t.Title = title
+	t.UpdatedAt = time.Now()
+	return nil
+}
+
+func (t *Todo) UpdateDescription(description string) {
+	t.Description = description
+	t.UpdatedAt = time.Now()
+}
+
+func (t *Todo) UpdateStatus(status Status) error {
+	if !status.Valid() {
+		return ErrInvalidStatus
+	}
+	t.Status = status
+	t.UpdatedAt = time.Now()
+	return nil
+}
+
+func (t *Todo) IsDone() bool {
+	return t.Status == StatusDone
+}
+
+# ===== FILE: internal\order\handler.go =====
+
+package order
+
+import (
+	"errors"
+	"net/http"
+
+	"github.com/labstack/echo/v4"
+)
+
+type Handler struct {
+	svc *Service
+}
+
+func NewHandler(svc *Service) *Handler {
+	return &Handler{svc: svc}
+}
+
+type createReq struct {
+	Title       string `json:"title" validate:"required,max=200"`
+	Description string `json:"description"`
+}
+
+type updateReq struct {
+	Title       *string `json:"title,omitempty" validate:"omitempty,max=200"`
+	Description *string `json:"description,omitempty"`
+	Status      *Status `json:"status,omitempty"`
+}
+
+type orderResp struct {
+	ID          string `json:"id"`
+	Title       string `json:"title"`
+	Description string `json:"description"`
+	Status      Status `json:"status"`
+	CreatedAt   int64  `json:"created_at"`
+	UpdatedAt   int64  `json:"updated_at"`
+}
+
+func toResp(o *Order) orderResp {
+	return orderResp{
+		ID:          o.ID,
+		Title:       o.Title,
+		Description: o.Description,
+		Status:      o.Status,
+		CreatedAt:   o.CreatedAt,
+		UpdatedAt:   o.UpdatedAt,
+	}
+}
+
+func (h *Handler) Create(c echo.Context) error {
+	var req createReq
+	if err := c.Bind(&req); err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request"})
+	}
+	o, err := h.svc.Create(c.Request().Context(), req.Title, req.Description)
+	if err != nil {
+		return h.handleErr(c, err)
+	}
+	return c.JSON(http.StatusCreated, toResp(o))
+}
+
+func (h *Handler) Get(c echo.Context) error {
+	id := c.Param("id")
+	o, err := h.svc.Get(c.Request().Context(), id)
+	if err != nil {
+		return h.handleErr(c, err)
+	}
+	return c.JSON(http.StatusOK, toResp(o))
+}
+
+func (h *Handler) GetAll(c echo.Context) error {
+	orders, err := h.svc.GetAll(c.Request().Context())
+	if err != nil {
+		return h.handleErr(c, err)
+	}
+	resp := make([]orderResp, len(orders))
+	for i, o := range orders {
+		resp[i] = toResp(o)
+	}
+	return c.JSON(http.StatusOK, resp)
+}
+
+func (h *Handler) Update(c echo.Context) error {
+	id := c.Param("id")
+	var req updateReq
+	if err := c.Bind(&req); err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request"})
+	}
+	in := UpdateInput{Title: req.Title, Description: req.Description, Status: req.Status}
+	o, err := h.svc.Update(c.Request().Context(), id, in)
+	if err != nil {
+		return h.handleErr(c, err)
+	}
+	return c.JSON(http.StatusOK, toResp(o))
+}
+
+func (h *Handler) Delete(c echo.Context) error {
+	id := c.Param("id")
+	if err := h.svc.Delete(c.Request().Context(), id); err != nil {
+		return h.handleErr(c, err)
+	}
+	return c.NoContent(http.StatusNoContent)
+}
+
+func (h *Handler) handleErr(c echo.Context, err error) error {
+	switch {
+	case errors.Is(err, ErrEmptyTitle):
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
+	case errors.Is(err, ErrTitleTooLong):
+		return c.JSON(http.StatusUnprocessableEntity, map[string]string{"error": err.Error()})
+	case errors.Is(err, ErrInvalidStatus):
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
+	case errors.Is(err, ErrNotFound):
+		return c.JSON(http.StatusNotFound, map[string]string{"error": "not found"})
+	default:
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "internal error"})
+	}
+}
+
+func (h *Handler) RegisterRoutes(g *echo.Group) {
+	g.POST("", h.Create)
+	g.GET("", h.GetAll)
+	g.GET("/:id", h.Get)
+	g.PUT("/:id", h.Update)
+	g.DELETE("/:id", h.Delete)
+}
+
+
+
+# ===== FILE: internal\order\repo.go =====
+
+package order
+
+import (
+	"context"
+	"errors"
+	"sync"
+
+	"github.com/google/uuid"
+)
+
+var (
+	ErrNotFound      = errors.New("order not found")
+	ErrEmptyTitle    = errors.New("title cannot be empty")
+	ErrTitleTooLong  = errors.New("title exceeds maximum length")
+	ErrInvalidStatus = errors.New("invalid status")
+)
+
+const MaxTitleLength = 200
+
+type Status string
+
+const (
+	StatusPending    Status = "pending"
+	StatusInProgress Status = "in_progress"
+	StatusDone       Status = "done"
+)
+
+func (s Status) Valid() bool {
+	switch s {
+	case StatusPending, StatusInProgress, StatusDone:
+		return true
+	default:
+		return false
+	}
+}
+
+type Order struct {
+	ID          string
+	Title       string
+	Description string
+	Status      Status
+	CreatedAt   int64
+	UpdatedAt   int64
+}
+
+type Repo struct {
+	mu    sync.RWMutex
+	items map[string]*Order
+}
+
+func NewRepo() *Repo {
+	return &Repo{items: make(map[string]*Order)}
+}
+
+func (r *Repo) Save(ctx context.Context, o *Order) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if o.ID == "" {
+		o.ID = uuid.New().String()
+	}
+	r.items[o.ID] = o
+	return nil
+}
+
+func (r *Repo) Get(ctx context.Context, id string) (*Order, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	o, ok := r.items[id]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	return o, nil
+}
+
+func (r *Repo) GetAll(ctx context.Context) ([]*Order, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	res := make([]*Order, 0, len(r.items))
+	for _, o := range r.items {
+		res = append(res, o)
+	}
+	return res, nil
+}
+
+func (r *Repo) Delete(ctx context.Context, id string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, ok := r.items[id]; !ok {
+		return ErrNotFound
+	}
+	delete(r.items, id)
+	return nil
+}
+
+# ===== FILE: internal\order\service.go =====
+
+package order
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"time"
+)
+
+type Service struct {
+	repo *Repo
+}
+
+func NewService(repo *Repo) *Service {
+	return &Service{repo: repo}
+}
+
+func (s *Service) Create(ctx context.Context, title, description string) (*Order, error) {
+	if title == "" {
+		return nil, ErrEmptyTitle
+	}
+	if len(title) > MaxTitleLength {
+		return nil, ErrTitleTooLong
+	}
+	now := time.Now().Unix()
+	o := &Order{
+		Title:       title,
+		Description: description,
+		Status:      StatusPending,
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}
+	if err := s.repo.Save(ctx, o); err != nil {
+		return nil, fmt.Errorf("save: %w", err)
+	}
+	return o, nil
+}
+
+func (s *Service) Get(ctx context.Context, id string) (*Order, error) {
+	return s.repo.Get(ctx, id)
+}
+
+func (s *Service) GetAll(ctx context.Context) ([]*Order, error) {
+	return s.repo.GetAll(ctx)
+}
+
+type UpdateInput struct {
+	Title       *string
+	Description *string
+	Status      *Status
+}
+
+func (s *Service) Update(ctx context.Context, id string, in UpdateInput) (*Order, error) {
+	o, err := s.repo.Get(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if in.Title != nil {
+		if *in.Title == "" {
+			return nil, ErrEmptyTitle
+		}
+		if len(*in.Title) > MaxTitleLength {
+			return nil, ErrTitleTooLong
+		}
+		o.Title = *in.Title
+	}
+	if in.Description != nil {
+		o.Description = *in.Description
+	}
+	if in.Status != nil {
+		if !in.Status.Valid() {
+			return nil, ErrInvalidStatus
+		}
+		o.Status = *in.Status
+	}
+	o.UpdatedAt = time.Now().Unix()
+	if err := s.repo.Save(ctx, o); err != nil {
+		return nil, fmt.Errorf("save: %w", err)
+	}
+	return o, nil
+}
+
+func (s *Service) Delete(ctx context.Context, id string) error {
+	if _, err := s.repo.Get(ctx, id); err != nil {
+		return err
+	}
+	return s.repo.Delete(ctx, id)
+}
+
+func (o *Order) IsDone() bool {
+	return o.Status == StatusDone
+}
+
+var _ error = ErrNotFound
+var _ error = ErrEmptyTitle
+var _ error = ErrTitleTooLong
+var _ error = ErrInvalidStatus
+
+func IsNotFound(err error) bool {
+	return errors.Is(err, ErrNotFound)
+}
+
+# ===== FILE: internal\payment\handler.go =====
+
+package payment
+
+import (
+	"errors"
+	"net/http"
+
+	"github.com/labstack/echo/v4"
+)
+
+type Handler struct {
+	svc *Service
+}
+
+func NewHandler(svc *Service) *Handler {
+	return &Handler{svc: svc}
+}
+
+type createReq struct {
+	OrderID string `json:"order_id" validate:"required"`
+	Amount  int64  `json:"amount" validate:"required,gt=0"`
+}
+
+type updateReq struct {
+	Status *Status `json:"status,omitempty"`
+}
+
+type paymentResp struct {
+	ID        string `json:"id"`
+	OrderID   string `json:"order_id"`
+	Amount    int64  `json:"amount"`
+	Status    Status `json:"status"`
+	CreatedAt int64  `json:"created_at"`
+	UpdatedAt int64  `json:"updated_at"`
+}
+
+func toResp(p *Payment) paymentResp {
+	return paymentResp{
+		ID:        p.ID,
+		OrderID:   p.OrderID,
+		Amount:    p.Amount,
+		Status:    p.Status,
+		CreatedAt: p.CreatedAt,
+		UpdatedAt: p.UpdatedAt,
+	}
+}
+
+func (h *Handler) Create(c echo.Context) error {
+	var req createReq
+	if err := c.Bind(&req); err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request"})
+	}
+	p, err := h.svc.Create(c.Request().Context(), req.OrderID, req.Amount)
+	if err != nil {
+		return h.handleErr(c, err)
+	}
+	return c.JSON(http.StatusCreated, toResp(p))
+}
+
+func (h *Handler) Get(c echo.Context) error {
+	id := c.Param("id")
+	p, err := h.svc.Get(c.Request().Context(), id)
+	if err != nil {
+		return h.handleErr(c, err)
+	}
+	return c.JSON(http.StatusOK, toResp(p))
+}
+
+func (h *Handler) GetByOrderID(c echo.Context) error {
+	orderID := c.Param("order_id")
+	payments, err := h.svc.GetByOrderID(c.Request().Context(), orderID)
+	if err != nil {
+		return h.handleErr(c, err)
+	}
+	resp := make([]paymentResp, len(payments))
+	for i, p := range payments {
+		resp[i] = toResp(p)
+	}
+	return c.JSON(http.StatusOK, resp)
+}
+
+func (h *Handler) GetAll(c echo.Context) error {
+	payments, err := h.svc.GetAll(c.Request().Context())
+	if err != nil {
+		return h.handleErr(c, err)
+	}
+	resp := make([]paymentResp, len(payments))
+	for i, p := range payments {
+		resp[i] = toResp(p)
+	}
+	return c.JSON(http.StatusOK, resp)
+}
+
+func (h *Handler) Update(c echo.Context) error {
+	id := c.Param("id")
+	var req updateReq
+	if err := c.Bind(&req); err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request"})
+	}
+	in := UpdateInput{Status: req.Status}
+	p, err := h.svc.Update(c.Request().Context(), id, in)
+	if err != nil {
+		return h.handleErr(c, err)
+	}
+	return c.JSON(http.StatusOK, toResp(p))
+}
+
+func (h *Handler) Delete(c echo.Context) error {
+	id := c.Param("id")
+	if err := h.svc.Delete(c.Request().Context(), id); err != nil {
+		return h.handleErr(c, err)
+	}
+	return c.NoContent(http.StatusNoContent)
+}
+
+func (h *Handler) handleErr(c echo.Context, err error) error {
+	switch {
+	case errors.Is(err, ErrInvalidAmount):
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
+	case errors.Is(err, ErrNotFound):
+		return c.JSON(http.StatusNotFound, map[string]string{"error": "not found"})
+	default:
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "internal error"})
+	}
+}
+
+func (h *Handler) RegisterRoutes(g *echo.Group) {
+	g.POST("", h.Create)
+	g.GET("", h.GetAll)
+	g.GET("/:id", h.Get)
+	g.GET("/order/:order_id", h.GetByOrderID)
+	g.PUT("/:id", h.Update)
+	g.DELETE("/:id", h.Delete)
+}
+
+# ===== FILE: internal\payment\repo.go =====
+
+package payment
+
+import (
+	"context"
+	"errors"
+	"sync"
+
+	"github.com/google/uuid"
+)
+
+var (
+	ErrNotFound     = errors.New("payment not found")
+	ErrInvalidAmount = errors.New("amount must be positive")
+)
+
+type Status string
+
+const (
+	StatusPending  Status = "pending"
+	StatusPaid     Status = "paid"
+	StatusFailed   Status = "failed"
+	StatusRefunded Status = "refunded"
+)
+
+func (s Status) Valid() bool {
+	switch s {
+	case StatusPending, StatusPaid, StatusFailed, StatusRefunded:
+		return true
+	default:
+		return false
+	}
+}
+
+type Payment struct {
+	ID        string
+	OrderID   string
+	Amount    int64
+	Status    Status
+	CreatedAt int64
+	UpdatedAt int64
+}
+
+type Repo struct {
+	mu    sync.RWMutex
+	items map[string]*Payment
+}
+
+func NewRepo() *Repo {
+	return &Repo{items: make(map[string]*Payment)}
+}
+
+func (r *Repo) Save(ctx context.Context, p *Payment) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if p.ID == "" {
+		p.ID = uuid.New().String()
+	}
+	r.items[p.ID] = p
+	return nil
+}
+
+func (r *Repo) Get(ctx context.Context, id string) (*Payment, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	p, ok := r.items[id]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	return p, nil
+}
+
+func (r *Repo) GetByOrderID(ctx context.Context, orderID string) ([]*Payment, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	res := make([]*Payment, 0)
+	for _, p := range r.items {
+		if p.OrderID == orderID {
+			res = append(res, p)
+		}
+	}
+	return res, nil
+}
+
+func (r *Repo) GetAll(ctx context.Context) ([]*Payment, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	res := make([]*Payment, 0, len(r.items))
+	for _, p := range r.items {
+		res = append(res, p)
+	}
+	return res, nil
+}
+
+func (r *Repo) Delete(ctx context.Context, id string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, ok := r.items[id]; !ok {
+		return ErrNotFound
+	}
+	delete(r.items, id)
+	return nil
+}
+
+# ===== FILE: internal\payment\service.go =====
+
+package payment
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"time"
+)
+
+type Service struct {
+	repo *Repo
+}
+
+func NewService(repo *Repo) *Service {
+	return &Service{repo: repo}
+}
+
+func (s *Service) Create(ctx context.Context, orderID string, amount int64) (*Payment, error) {
+	if amount <= 0 {
+		return nil, ErrInvalidAmount
+	}
+	now := time.Now().Unix()
+	p := &Payment{
+		OrderID:   orderID,
+		Amount:    amount,
+		Status:    StatusPending,
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	if err := s.repo.Save(ctx, p); err != nil {
+		return nil, fmt.Errorf("save: %w", err)
+	}
+	return p, nil
+}
+
+func (s *Service) Get(ctx context.Context, id string) (*Payment, error) {
+	return s.repo.Get(ctx, id)
+}
+
+func (s *Service) GetByOrderID(ctx context.Context, orderID string) ([]*Payment, error) {
+	return s.repo.GetByOrderID(ctx, orderID)
+}
+
+func (s *Service) GetAll(ctx context.Context) ([]*Payment, error) {
+	return s.repo.GetAll(ctx)
+}
+
+type UpdateInput struct {
+	Status *Status
+}
+
+func (s *Service) Update(ctx context.Context, id string, in UpdateInput) (*Payment, error) {
+	p, err := s.repo.Get(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if in.Status != nil {
+		if !in.Status.Valid() {
+			return nil, errors.New("invalid status")
+		}
+		p.Status = *in.Status
+	}
+	p.UpdatedAt = time.Now().Unix()
+	if err := s.repo.Save(ctx, p); err != nil {
+		return nil, fmt.Errorf("save: %w", err)
+	}
+	return p, nil
+}
+
+func (s *Service) Delete(ctx context.Context, id string) error {
+	if _, err := s.repo.Get(ctx, id); err != nil {
+		return err
+	}
+	return s.repo.Delete(ctx, id)
+}
+
+func IsNotFound(err error) bool {
+	return errors.Is(err, ErrNotFound)
+}
+
+# ===== FILE: internal\usecase\create_todo.go =====
+
+package usecase
+
+import (
+	"context"
+	"fmt"
+
+	"github.com/example/todo/internal/domain"
+)
+
+type CreateTodo struct {
+	Repo  TodoRepo
+	IDs   IDGenerator
+}
+
+func (uc *CreateTodo) Do(ctx context.Context, title, description string) (*domain.Todo, error) {
+	todo, err := domain.NewTodo(title, description)
+	if err != nil {
+		return nil, err
+	}
+	todo.ID = uc.IDs.New()
+
+	if err := uc.Repo.Save(ctx, todo); err != nil {
+		return nil, fmt.Errorf("save todo: %w", err)
+	}
+	return todo, nil
+}
+
+# ===== FILE: internal\usecase\delete_todo.go =====
+
+package usecase
+
+import (
+	"context"
+	"fmt"
+)
+
+type DeleteTodo struct {
+	Repo TodoRepo
+}
+
+func (uc *DeleteTodo) Do(ctx context.Context, id string) error {
+	_, err := uc.Repo.Get(ctx, id)
+	if err != nil {
+		return fmt.Errorf("get todo: %w", err)
+	}
+	if err := uc.Repo.Delete(ctx, id); err != nil {
+		return fmt.Errorf("delete todo: %w", err)
+	}
+	return nil
+}
+
+# ===== FILE: internal\usecase\example.go =====
+
+package usecase
+
+type ExampleRepo interface {
+}
+
+// Реализация usecase
+// func (uc ) Do() {}
+
+/*
+func (uc CreateOrder) Do(ctx context.Context, userID string, items []domain.Item) (domain.Order, error) {
+	order := domain.Order{ID: uc.IDs.New(), UserID: userID, Items: items}
+
+	if err := order.Validate(); err != nil { // правило проверяет domain
+		return domain.Order{}, err
+	}
+
+	if err := uc.Repo.Save(ctx, order); err != nil { // вызов через интерфейс
+		return domain.Order{}, fmt.Errorf("сохранить заказ: %w", err)
+	}
+
+	if err := uc.Notifier.OrderCreated(ctx, order); err != nil {
+		return order, nil // заказ создан, уведомление не
+	}
+
+	return order, nil
+}
+*/
+
+
+# ===== FILE: internal\usecase\get_all_todos.go =====
+
+package usecase
+
+import (
+	"context"
+	"fmt"
+
+	"github.com/example/todo/internal/domain"
+)
+
+type GetAllTodos struct {
+	Repo TodoRepo
+}
+
+func (uc *GetAllTodos) Do(ctx context.Context) ([]*domain.Todo, error) {
+	todos, err := uc.Repo.GetAll(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("get all todos: %w", err)
+	}
+	return todos, nil
+}
+
+# ===== FILE: internal\usecase\get_todo.go =====
+
+package usecase
+
+import (
+	"context"
+	"fmt"
+
+	"github.com/example/todo/internal/domain"
+)
+
+type GetTodo struct {
+	Repo TodoRepo
+}
+
+func (uc *GetTodo) Do(ctx context.Context, id string) (*domain.Todo, error) {
+	todo, err := uc.Repo.Get(ctx, id)
+	if err != nil {
+		return nil, fmt.Errorf("get todo: %w", err)
+	}
+	return todo, nil
+}
+
+# ===== FILE: internal\usecase\interfaces.go =====
+
+package usecase
+
+import (
+	"context"
+
+	"github.com/example/todo/internal/domain"
+)
+
+type TodoRepo interface {
+	Save(ctx context.Context, todo *domain.Todo) error
+	Get(ctx context.Context, id string) (*domain.Todo, error)
+	GetAll(ctx context.Context) ([]*domain.Todo, error)
+	Delete(ctx context.Context, id string) error
+}
+
+type IDGenerator interface {
+	New() string
+}
+
+# ===== FILE: internal\usecase\update_todo.go =====
+
+package usecase
+
+import (
+	"context"
+	"fmt"
+
+	"github.com/example/todo/internal/domain"
+)
+
+type UpdateTodo struct {
+	Repo TodoRepo
+}
+
+type UpdateTodoInput struct {
+	Title       *string
+	Description *string
+	Status      *domain.Status
+}
+
+func (uc *UpdateTodo) Do(ctx context.Context, id string, input UpdateTodoInput) (*domain.Todo, error) {
+	todo, err := uc.Repo.Get(ctx, id)
+	if err != nil {
+		return nil, fmt.Errorf("get todo: %w", err)
+	}
+
+	if input.Title != nil {
+		if err := todo.UpdateTitle(*input.Title); err != nil {
+			return nil, err
+		}
+	}
+	if input.Description != nil {
+		todo.UpdateDescription(*input.Description)
+	}
+	if input.Status != nil {
+		if err := todo.UpdateStatus(*input.Status); err != nil {
+			return nil, err
+		}
+	}
+
+	if err := uc.Repo.Save(ctx, todo); err != nil {
+		return nil, fmt.Errorf("save todo: %w", err)
+	}
+	return todo, nil
+}
+
+# ===== FILE: internal\user\handler.go =====
+
+package user
+
+import (
+	"errors"
+	"net/http"
+
+	"github.com/labstack/echo/v4"
+)
+
+type Handler struct {
+	svc *Service
+}
+
+func NewHandler(svc *Service) *Handler {
+	return &Handler{svc: svc}
+}
+
+type createReq struct {
+	Email string `json:"email" validate:"required,email"`
+	Name  string `json:"name" validate:"required"`
+}
+
+type updateReq struct {
+	Email *string `json:"email,omitempty" validate:"omitempty,email"`
+	Name  *string `json:"name,omitempty"`
+}
+
+type userResp struct {
+	ID        string `json:"id"`
+	Email     string `json:"email"`
+	Name      string `json:"name"`
+	CreatedAt int64  `json:"created_at"`
+	UpdatedAt int64  `json:"updated_at"`
+}
+
+func toResp(u *User) userResp {
+	return userResp{
+		ID:        u.ID,
+		Email:     u.Email,
+		Name:      u.Name,
+		CreatedAt: u.CreatedAt,
+		UpdatedAt: u.UpdatedAt,
+	}
+}
+
+func (h *Handler) Create(c echo.Context) error {
+	var req createReq
+	if err := c.Bind(&req); err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request"})
+	}
+	u, err := h.svc.Create(c.Request().Context(), req.Email, req.Name)
+	if err != nil {
+		return h.handleErr(c, err)
+	}
+	return c.JSON(http.StatusCreated, toResp(u))
+}
+
+func (h *Handler) Get(c echo.Context) error {
+	id := c.Param("id")
+	u, err := h.svc.Get(c.Request().Context(), id)
+	if err != nil {
+		return h.handleErr(c, err)
+	}
+	return c.JSON(http.StatusOK, toResp(u))
+}
+
+func (h *Handler) GetByEmail(c echo.Context) error {
+	email := c.QueryParam("email")
+	if email == "" {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "email required"})
+	}
+	u, err := h.svc.GetByEmail(c.Request().Context(), email)
+	if err != nil {
+		return h.handleErr(c, err)
+	}
+	return c.JSON(http.StatusOK, toResp(u))
+}
+
+func (h *Handler) GetAll(c echo.Context) error {
+	users, err := h.svc.GetAll(c.Request().Context())
+	if err != nil {
+		return h.handleErr(c, err)
+	}
+	resp := make([]userResp, len(users))
+	for i, u := range users {
+		resp[i] = toResp(u)
+	}
+	return c.JSON(http.StatusOK, resp)
+}
+
+func (h *Handler) Update(c echo.Context) error {
+	id := c.Param("id")
+	var req updateReq
+	if err := c.Bind(&req); err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request"})
+	}
+	in := UpdateInput{Email: req.Email, Name: req.Name}
+	u, err := h.svc.Update(c.Request().Context(), id, in)
+	if err != nil {
+		return h.handleErr(c, err)
+	}
+	return c.JSON(http.StatusOK, toResp(u))
+}
+
+func (h *Handler) Delete(c echo.Context) error {
+	id := c.Param("id")
+	if err := h.svc.Delete(c.Request().Context(), id); err != nil {
+		return h.handleErr(c, err)
+	}
+	return c.NoContent(http.StatusNoContent)
+}
+
+func (h *Handler) handleErr(c echo.Context, err error) error {
+	switch {
+	case errors.Is(err, ErrInvalidEmail):
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
+	case errors.Is(err, ErrEmailExists):
+		return c.JSON(http.StatusConflict, map[string]string{"error": err.Error()})
+	case errors.Is(err, ErrNotFound):
+		return c.JSON(http.StatusNotFound, map[string]string{"error": "not found"})
+	default:
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "internal error"})
+	}
+}
+
+func (h *Handler) RegisterRoutes(g *echo.Group) {
+	g.POST("", h.Create)
+	g.GET("", h.GetAll)
+	g.GET("/:id", h.Get)
+	g.GET("/by-email", h.GetByEmail)
+	g.PUT("/:id", h.Update)
+	g.DELETE("/:id", h.Delete)
+}
+
+# ===== FILE: internal\user\repo.go =====
+
+package user
+
+import (
+	"context"
+	"errors"
+	"sync"
+
+	"github.com/google/uuid"
+)
+
+var (
+	ErrNotFound    = errors.New("user not found")
+	ErrEmailExists = errors.New("email already exists")
+	ErrInvalidEmail = errors.New("invalid email")
+)
+
+type User struct {
+	ID        string
+	Email     string
+	Name      string
+	CreatedAt int64
+	UpdatedAt int64
+}
+
+type Repo struct {
+	mu      sync.RWMutex
+	items   map[string]*User
+	byEmail map[string]*User
+}
+
+func NewRepo() *Repo {
+	return &Repo{
+		items:   make(map[string]*User),
+		byEmail: make(map[string]*User),
+	}
+}
+
+func (r *Repo) Save(ctx context.Context, u *User) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if u.ID == "" {
+		u.ID = uuid.New().String()
+	}
+	if existing, ok := r.byEmail[u.Email]; ok && existing.ID != u.ID {
+		return ErrEmailExists
+	}
+	r.items[u.ID] = u
+	r.byEmail[u.Email] = u
+	return nil
+}
+
+func (r *Repo) Get(ctx context.Context, id string) (*User, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	u, ok := r.items[id]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	return u, nil
+}
+
+func (r *Repo) GetByEmail(ctx context.Context, email string) (*User, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	u, ok := r.byEmail[email]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	return u, nil
+}
+
+func (r *Repo) GetAll(ctx context.Context) ([]*User, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	res := make([]*User, 0, len(r.items))
+	for _, u := range r.items {
+		res = append(res, u)
+	}
+	return res, nil
+}
+
+func (r *Repo) Delete(ctx context.Context, id string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	u, ok := r.items[id]
+	if !ok {
+		return ErrNotFound
+	}
+	delete(r.items, id)
+	delete(r.byEmail, u.Email)
+	return nil
+}
+
+# ===== FILE: internal\user\service.go =====
+
+package user
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+)
+
+type Service struct {
+	repo *Repo
+}
+
+func NewService(repo *Repo) *Service {
+	return &Service{repo: repo}
+}
+
+func (s *Service) Create(ctx context.Context, email, name string) (*User, error) {
+	if !isValidEmail(email) {
+		return nil, ErrInvalidEmail
+	}
+	now := time.Now().Unix()
+	u := &User{
+		Email:     email,
+		Name:      name,
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	if err := s.repo.Save(ctx, u); err != nil {
+		return nil, fmt.Errorf("save: %w", err)
+	}
+	return u, nil
+}
+
+func (s *Service) Get(ctx context.Context, id string) (*User, error) {
+	return s.repo.Get(ctx, id)
+}
+
+func (s *Service) GetByEmail(ctx context.Context, email string) (*User, error) {
+	return s.repo.GetByEmail(ctx, email)
+}
+
+func (s *Service) GetAll(ctx context.Context) ([]*User, error) {
+	return s.repo.GetAll(ctx)
+}
+
+type UpdateInput struct {
+	Email *string
+	Name  *string
+}
+
+func (s *Service) Update(ctx context.Context, id string, in UpdateInput) (*User, error) {
+	u, err := s.repo.Get(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if in.Email != nil {
+		if !isValidEmail(*in.Email) {
+			return nil, ErrInvalidEmail
+		}
+		u.Email = *in.Email
+	}
+	if in.Name != nil {
+		u.Name = *in.Name
+	}
+	u.UpdatedAt = time.Now().Unix()
+	if err := s.repo.Save(ctx, u); err != nil {
+		return nil, fmt.Errorf("save: %w", err)
+	}
+	return u, nil
+}
+
+func (s *Service) Delete(ctx context.Context, id string) error {
+	if _, err := s.repo.Get(ctx, id); err != nil {
+		return err
+	}
+	return s.repo.Delete(ctx, id)
+}
+
+func isValidEmail(email string) bool {
+	return strings.Contains(email, "@") && len(email) > 3
+}
+
+func IsNotFound(err error) bool {
+	return errors.Is(err, ErrNotFound)
+}
+func IsEmailExists(err error) bool {
+	return errors.Is(err, ErrEmailExists)
+}
+
+# ===== FILE: internal\adapter\http\server.go =====
+
+package http
+
+import (
+	"context"
+	"net/http"
+	"time"
+
+	"github.com/labstack/echo/v4"
+	"github.com/labstack/echo/v4/middleware"
+)
+
+type Server struct {
+	e *echo.Echo
+}
+
+func NewServer() *Server {
+	e := echo.New()
+	e.Use(middleware.Logger())
+	e.Use(middleware.Recover())
+	e.Use(middleware.CORS())
+
+	return &Server{e: e}
+}
+
+func (s *Server) RegisterRoutes(register func(*echo.Group)) {
+	api := s.e.Group("/api/v1")
+	register(api)
+}
+
+func (s *Server) Start(addr string) error {
+	return s.e.Start(addr)
+}
+
+func (s *Server) Shutdown(ctx context.Context) error {
+	return s.e.Shutdown(ctx)
+}
+
+func (s *Server) StartGraceful(addr string, shutdownTimeout time.Duration) error {
+	go func() {
+		if err := s.e.Start(addr); err != nil && err != http.ErrServerClosed {
+			s.e.Logger.Fatalf("server error: %v", err)
+		}
+	}()
+
+	quit := make(chan struct{}, 1)
+	go func() {
+		<-quit
+		ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+		defer cancel()
+		if err := s.e.Shutdown(ctx); err != nil {
+			s.e.Logger.Fatalf("server forced to shutdown: %v", err)
+		}
+	}()
+
+	return nil
+}
+
+# ===== FILE: internal\adapter\memory\repo.go =====
+
+package memory
+
+import (
+	"context"
+	"sync"
+
+	"github.com/example/todo/internal/domain"
+	"github.com/google/uuid"
+)
+
+type Repo struct {
+	mu    sync.RWMutex
+	items map[string]*domain.Todo
+}
+
+func NewRepo() *Repo {
+	return &Repo{
+		items: make(map[string]*domain.Todo),
+	}
+}
+
+func (r *Repo) Save(ctx context.Context, todo *domain.Todo) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if todo.ID == "" {
+		todo.ID = uuid.New().String()
+	}
+	r.items[todo.ID] = todo
+	return nil
+}
+
+func (r *Repo) Get(ctx context.Context, id string) (*domain.Todo, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	todo, ok := r.items[id]
+	if !ok {
+		return nil, domain.ErrNotFound
+	}
+	return todo, nil
+}
+
+func (r *Repo) GetAll(ctx context.Context) ([]*domain.Todo, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	todos := make([]*domain.Todo, 0, len(r.items))
+	for _, t := range r.items {
+		todos = append(todos, t)
+	}
+	return todos, nil
+}
+
+func (r *Repo) Delete(ctx context.Context, id string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, ok := r.items[id]; !ok {
+		return domain.ErrNotFound
+	}
+	delete(r.items, id)
+	return nil
+}
+
+type IDGenerator struct{}
+
+func (g *IDGenerator) New() string {
+	return uuid.New().String()
+}
+
+# ===== FILE: pkg\errors\wrap.go =====
+
+package errutils
+
+import (
+	"fmt"
+	"path"
+	"runtime"
+)
+
+func WrapPathErr(err error) error {
+	if err == nil {
+		return nil
+	}
+
+	pc, _, line, ok := runtime.Caller(1)
+	if !ok {
+		return fmt.Errorf("[unknown:0] %w", err)
+	}
+
+	fullFn := runtime.FuncForPC(pc).Name()
+	fnName := path.Base(fullFn)
+	return fmt.Errorf("[%s:%d] %w", fnName, line, err)
+}
+
+
+# ===== FILE: pkg\hasher\password.go =====
+
+package hasher
+
+import (
+	"crypto/sha1"
+	"fmt"
+)
+
+type PasswordHasher interface {
+	Hash(password string) string
+}
+
+type SHA1Hasher struct {
+	salt string
+}
+
+func NewSHA1Hasher(salt string) *SHA1Hasher {
+	return &SHA1Hasher{salt}
+}
+
+func (h *SHA1Hasher) Hash(password string) string {
+	hash := sha1.New()
+	hash.Write([]byte(password))
+	return fmt.Sprintf("%x", hash.Sum([]byte(h.salt)))
+}
+
+
+# ===== FILE: pkg\httpserver\options.go =====
+
+package httpserver
+
+import (
+	"time"
+)
+
+type Option func(*HttpServer)
+
+func Address(address string) Option {
+	return func(hs *HttpServer) {
+		hs.server.Addr = address
+	}
+}
+
+func ReadTimeout(timeout time.Duration) Option {
+	return func(s *HttpServer) {
+		s.server.ReadTimeout = timeout
+	}
+}
+
+func WriteTimeout(timeout time.Duration) Option {
+	return func(s *HttpServer) {
+		s.server.WriteTimeout = timeout
+	}
+}
+
+func ShutdownTimeout(timeout time.Duration) Option {
+	return func(s *HttpServer) {
+		s.shutdownTimeout = timeout
+	}
+}
+
+
+# ===== FILE: pkg\httpserver\server.go =====
+
+package httpserver
+
+import (
+	"context"
+	"net/http"
+	"time"
+)
+
+const (
+	defaultReadTimeout     = 5 * time.Second
+	defaultWriteTimeout    = 5 * time.Second
+	defaultAddr            = "0.0.0.0:8080"
+	defaultShutdownTimeout = 3 * time.Second
+)
+
+type HttpServer struct {
+	server          *http.Server
+	notify          chan error
+	shutdownTimeout time.Duration
+}
+
+func New(handler http.Handler, opts ...Option) *HttpServer {
+	httpServer := &http.Server{
+		Handler:      handler,
+		ReadTimeout:  defaultReadTimeout,
+		WriteTimeout: defaultWriteTimeout,
+		Addr:         defaultAddr,
+	}
+
+	s := &HttpServer{
+		server:          httpServer,
+		notify:          make(chan error, 1),
+		shutdownTimeout: defaultShutdownTimeout,
+	}
+
+	for _, opt := range opts {
+		opt(s)
+	}
+
+	s.start()
+
+	return s
+}
+
+func (s *HttpServer) start() {
+	go func() {
+		s.notify <- s.server.ListenAndServe()
+		close(s.notify)
+	}()
+}
+
+func (s *HttpServer) Notify() <-chan error {
+	return s.notify
+}
+
+func (s *HttpServer) Shutdown() error {
+	ctx, cancel := context.WithTimeout(context.Background(), s.shutdownTimeout)
+	defer cancel()
+
+	return s.server.Shutdown(ctx)
+}
+
+
+# ===== FILE: pkg\logger\logger.go =====
+
+package logger
+
+import (
+	"fmt"
+	"path"
+	"runtime"
+
+	log "github.com/sirupsen/logrus"
+)
+
+func SetupLogger(level string) {
+	loggerLevel, err := log.ParseLevel(level)
+	log.SetReportCaller(true)
+
+	log.SetFormatter(&log.JSONFormatter{
+		CallerPrettyfier: func(frame *runtime.Frame) (function string, file string) {
+			return "", fmt.Sprintf("%s:%d", path.Base(frame.File), frame.Line)
+		},
+		TimestampFormat: "2006-01-02 15:04:05",
+	})
+
+	if err != nil {
+		log.Infof("Level setup default INFO, err: %v", err)
+		log.SetLevel(log.InfoLevel)
+	} else {
+		log.SetLevel(loggerLevel)
+	}
+}
+
+
+# ===== FILE: pkg\postgres\options.go =====
+
+package postgres
+
+import "time"
+
+type Option func(*Postgres)
+
+func MaxPoolSize(size int) Option {
+	return func(p *Postgres) {
+		p.maxPoolSize = size
+	}
+}
+
+func ConnAttempts(attempts int) Option {
+	return func(p *Postgres) {
+		p.connAttempts = attempts
+	}
+}
+
+func ConnTimeout(timeout time.Duration) Option {
+	return func(p *Postgres) {
+		p.connTimeout = timeout
+	}
+}
+
+
+# ===== FILE: pkg\postgres\postgres.go =====
+
+package postgres
+
+import (
+	"context"
+	"time"
+
+	errutils "github.com/Egor213/PVZ/pkg/errors"
+
+	"github.com/Masterminds/squirrel"
+	trmpgx "github.com/avito-tech/go-transaction-manager/drivers/pgxv5/v2"
+	"github.com/jackc/pgx/v5/pgxpool"
+	log "github.com/sirupsen/logrus"
+)
+
+const (
+	DefaultMaxPoolSize  = 1
+	DefaultConnAttempts = 10
+	DefaultConnTimeout  = time.Second
+)
+
+type Postgres struct {
+	Builder      squirrel.StatementBuilderType
+	CtxGetter    *trmpgx.CtxGetter
+	Pool         *pgxpool.Pool
+	maxPoolSize  int
+	connAttempts int
+	connTimeout  time.Duration
+}
+
+func New(pgUrl string, opts ...Option) (*Postgres, error) {
+	pg := &Postgres{
+		maxPoolSize:  DefaultMaxPoolSize,
+		connAttempts: DefaultConnAttempts,
+		connTimeout:  DefaultConnTimeout,
+		CtxGetter:    trmpgx.DefaultCtxGetter,
+		Builder:      squirrel.StatementBuilder.PlaceholderFormat(squirrel.Dollar),
+	}
+
+	for _, opt := range opts {
+		opt(pg)
+	}
+
+	poolConfig, err := pgxpool.ParseConfig(pgUrl)
+	if err != nil {
+		return nil, errutils.WrapPathErr(err)
+	}
+
+	poolConfig.MaxConns = int32(pg.maxPoolSize)
+
+	for pg.connAttempts > 0 {
+		pg.Pool, err = pgxpool.NewWithConfig(context.Background(), poolConfig)
+		if err != nil {
+			return nil, errutils.WrapPathErr(err)
+		}
+
+		if err = pg.Pool.Ping(context.Background()); err == nil {
+			break
+		}
+
+		pg.connAttempts--
+		log.Infof("Postgres trying to connect, attempts left: %d", pg.connAttempts)
+		time.Sleep(pg.connTimeout)
+	}
+
+	if err != nil {
+		return nil, errutils.WrapPathErr(err)
+	}
+
+	return pg, nil
+}
+
+func (p *Postgres) Close() {
+	if p.Pool != nil {
+		p.Pool.Close()
+	}
+}
+
+
+# ===== FILE: pkg\validator\custom.go =====
+
+package validator
+
+import (
+	"fmt"
+	"reflect"
+	"strings"
+
+	"github.com/go-playground/validator/v10"
+)
+
+type CustomValidator struct {
+	v *validator.Validate
+}
+
+func NewCustomValidator() *CustomValidator {
+	v := validator.New()
+	cv := &CustomValidator{v: v}
+
+	v.RegisterTagNameFunc(func(fld reflect.StructField) string {
+		name := strings.SplitN(fld.Tag.Get("json"), ",", 2)[0]
+		if name == "-" {
+			return ""
+		}
+		return name
+	})
+
+	v.RegisterTagNameFunc(func(fld reflect.StructField) string {
+		name := strings.SplitN(fld.Tag.Get("query"), ",", 2)[0]
+		if name == "-" {
+			return ""
+		}
+		return name
+	})
+
+	return cv
+}
+
+func (cv *CustomValidator) Validate(i any) error {
+	err := cv.v.Struct(i)
+	if err != nil {
+		fieldErr := err.(validator.ValidationErrors)[0]
+		print(fieldErr.StructField())
+		return cv.newValidationError(fieldErr.Field(), fieldErr.Tag(), fieldErr.Param())
+	}
+	return nil
+}
+
+func (cv *CustomValidator) newValidationError(field string, tag string, param string) error {
+	switch tag {
+	case "required":
+		return fmt.Errorf("field %s is required", field)
+	case "min":
+		return fmt.Errorf("field %s must be at least %s characters", field, param)
+	case "max":
+		return fmt.Errorf("field %s must be at most %s characters", field, param)
+	default:
+		return fmt.Errorf("field %s is invalid", field)
+	}
+}
